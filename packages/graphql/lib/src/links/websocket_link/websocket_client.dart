@@ -10,8 +10,9 @@ import 'package:graphql/src/utilities/platform.dart';
 import 'package:meta/meta.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:stream_channel/stream_channel.dart';
+import 'package:uuid/data.dart';
+import 'package:uuid/rng.dart';
 import 'package:uuid/uuid.dart';
-import 'package:uuid/uuid_util.dart';
 import 'package:web_socket_channel/status.dart' as ws_status;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -26,7 +27,7 @@ typedef WebSocketConnect = FutureOr<WebSocketChannel> Function(
 );
 
 // create uuid generator
-final _uuid = Uuid(options: {'grng': UuidUtil.cryptoRNG});
+final _uuid = Uuid(goptions: GlobalOptions(CryptoRNG()));
 
 class SubscriptionListener {
   Function callback;
@@ -175,15 +176,13 @@ class SocketSubProtocol {
 class GraphQLProtocol {
   GraphQLProtocol._();
 
-  /// graphql-ws: The new  (not to be confused with the graphql-ws library).
+  /// graphql-ws: Old protocol (not to be confused with the graphql-ws library).
   /// NB. This protocol is it no longer maintained, please consider
   /// to use `SocketSubProtocol.graphqlTransportWs`.
   static const String graphqlWs = "graphql-ws";
 
-  /// graphql-transport-ws: New ws protocol used by most Apollo Server instances
-  /// with subscriptions enabled use this library.
-  /// N.B: not to be confused with the graphql-ws library that implement the
-  /// old ws protocol.
+  /// graphql-transport-ws: New protocol used by most Apollo Server instances
+  /// with subscriptions enabled. Implemented by the graphql-ws library.
   static const String graphqlTransportWs = "graphql-transport-ws";
 }
 
@@ -214,7 +213,8 @@ class SocketClient {
   final SocketClientConfig config;
 
   final BehaviorSubject<SocketConnectionState> _connectionStateController =
-      BehaviorSubject<SocketConnectionState>();
+      BehaviorSubject<SocketConnectionState>.seeded(
+          SocketConnectionState.notConnected);
 
   final HashMap<String, SubscriptionListener> _subscriptionInitializers =
       HashMap();
@@ -371,8 +371,8 @@ class SocketClient {
   }
 
   void onConnectionLost([Object? e]) async {
-    var code = socketChannel!.closeCode;
-    var reason = socketChannel!.closeReason;
+    var code = socketChannel?.closeCode;
+    var reason = socketChannel?.closeReason;
 
     await _closeSocketChannel();
     if (e != null) {
@@ -472,10 +472,8 @@ class SocketClient {
     final bool waitForConnection,
   ) {
     final String id = _uuid.v4(
-      options: {
-        'random': randomBytesForUuid,
-      },
-    ).toString();
+      config: V4Options(randomBytesForUuid, null),
+    );
     final StreamController<Response> response = StreamController<Response>();
     StreamSubscription<SocketConnectionState>? sub;
     final bool addTimeout =
@@ -503,6 +501,7 @@ class SocketClient {
             )
           : waitForConnectedStateWithoutTimeout;
 
+      sub?.cancel();
       sub = waitForConnectedState.listen((_) {
         final Stream<GraphQLSocketMessage> dataErrorComplete = _messages.where(
           (GraphQLSocketMessage message) {
@@ -576,12 +575,14 @@ class SocketClient {
             .listen((message) => response.addError(message));
 
         if (!_subscriptionInitializers[id]!.hasBeenTriggered) {
-          GraphQLSocketMessage operation = StartOperation(
-            id,
-            serialize(payload),
-          );
+          GraphQLSocketMessage operation;
           if (protocol == GraphQLProtocol.graphqlTransportWs) {
             operation = SubscribeOperation(
+              id,
+              serialize(payload),
+            );
+          } else {
+            operation = StartOperation(
               id,
               serialize(payload),
             );
@@ -636,8 +637,14 @@ class GraphQLWebSocketChannel extends StreamChannelMixin<dynamic>
   Stream<GraphQLSocketMessage>? _messages;
 
   /// Stream of messages from the endpoint parsed as GraphQLSocketMessages
-  Stream<GraphQLSocketMessage> get messages => _messages ??=
-      stream.map<GraphQLSocketMessage>(GraphQLSocketMessage.parse);
+  Stream<GraphQLSocketMessage> get messages {
+    if (_messages == null)
+      _messages = stream.map((event) {
+        return GraphQLSocketMessage.parse(event);
+      }).asBroadcastStream();
+
+    return _messages!;
+  }
 
   String? get protocol => _webSocket.protocol;
 
